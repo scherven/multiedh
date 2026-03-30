@@ -7,6 +7,20 @@ interface Props {
   existing: string[];
 }
 
+/** Bolds the first occurrence of `query` inside `text`. */
+function HighlightMatch({ text, query }: { text: string; query: string }) {
+  if (!query) return <>{text}</>;
+  const idx = text.toLowerCase().indexOf(query.toLowerCase());
+  if (idx === -1) return <>{text}</>;
+  return (
+    <>
+      {text.slice(0, idx)}
+      <span className="font-semibold text-white">{text.slice(idx, idx + query.length)}</span>
+      {text.slice(idx + query.length)}
+    </>
+  );
+}
+
 /** Tiny card thumbnail used inside the autocomplete dropdown. */
 function SuggestionThumb({ name }: { name: string }) {
   const [img, setImg] = useState<string | null>(null);
@@ -72,20 +86,22 @@ export default function CardInput({ onAdd, existing }: Props) {
         onChange={(e) => { setValue(e.target.value); setActiveIdx(-1); }}
         onKeyDown={onKeyDown}
         placeholder="Add a card…"
-        className="w-full px-4 py-2 rounded-lg bg-gray-800 border border-gray-600 text-white placeholder-gray-400 focus:outline-none focus:border-indigo-500"
+        className="w-full px-4 py-2 rounded-lg bg-gray-800 border border-gray-600 text-white placeholder-gray-400 focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/50 transition-shadow"
       />
       {suggestions.length > 0 && (
-        <ul className="absolute z-10 mt-1 w-full bg-gray-800 border border-gray-600 rounded-lg overflow-hidden shadow-lg">
+        <ul className="absolute z-10 mt-1 w-full bg-gray-800 border border-gray-600 rounded-lg overflow-hidden shadow-lg max-h-72 overflow-y-auto animate-fade-in-up">
           {suggestions.map((s, i) => (
             <li
               key={s}
               className={`flex items-center gap-3 px-3 py-1.5 cursor-pointer text-sm ${
-                i === activeIdx ? "bg-indigo-600 text-white" : "text-gray-200 hover:bg-gray-700"
+                i === activeIdx ? "bg-indigo-600 text-white" : "text-gray-300 hover:bg-gray-700"
               }`}
               onMouseDown={() => commit(s)}
             >
               <SuggestionThumb name={s} />
-              <span className="truncate">{s}</span>
+              <span className="truncate">
+                <HighlightMatch text={s} query={value} />
+              </span>
             </li>
           ))}
         </ul>

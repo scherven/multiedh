@@ -13,7 +13,28 @@ function drainQueue() {
   }
 }
 
-// ── image cache (keyed by lowercased card name) ──────────────────────────────
+// ── localStorage persistence ──────────────────────────────────────────────────
+const LS_PREFIX = "scryfall:img:";
+
+function lsGet(key: string): string | null | undefined {
+  try {
+    const raw = localStorage.getItem(LS_PREFIX + key);
+    if (raw === null) return undefined;          // never stored
+    return raw === "" ? null : raw;              // "" encodes a null result
+  } catch {
+    return undefined;
+  }
+}
+
+function lsSet(key: string, url: string | null): void {
+  try {
+    localStorage.setItem(LS_PREFIX + key, url ?? "");
+  } catch {
+    // localStorage full or unavailable — silently ignore
+  }
+}
+
+// ── in-memory cache (keyed by lowercased card name) ──────────────────────────
 const imageCache = new Map<string, Promise<string | null>>();
 
 async function searchOldest(name: string): Promise<string | null> {
@@ -39,12 +60,25 @@ async function searchOldest(name: string): Promise<string | null> {
 /** Return (and cache) the small image URL for the oldest printing of a card. */
 export function fetchCardImage(name: string): Promise<string | null> {
   const key = name.toLowerCase();
+
+  // 1. In-memory cache (fastest)
   if (imageCache.has(key)) return imageCache.get(key)!;
 
+  // 2. localStorage cache (free across page loads / restarts)
+  const stored = lsGet(key);
+  if (stored !== undefined) {
+    const hit = Promise.resolve(stored);
+    imageCache.set(key, hit);
+    return hit;
+  }
+
+  // 3. Network fetch, then persist to both caches
   const promise = new Promise<string | null>((resolve) => {
     queue.push(async () => {
       try {
-        resolve(await searchOldest(name));
+        const url = await searchOldest(name);
+        lsSet(key, url);
+        resolve(url);
       } catch {
         resolve(null);
       } finally {
