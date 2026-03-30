@@ -1,4 +1,7 @@
 import asyncio
+import json
+from pathlib import Path
+
 import httpx
 from tqdm import tqdm
 
@@ -9,30 +12,76 @@ LIST_PARAMS = {"formats": 3, "pageSize": 100, "orderBy": "-createdAt"}
 
 # Seconds between list-page requests
 _LIST_DELAY = 2.0
-# Max concurrent individual-deck fetches
-_CONCURRENCY = 10
+# Seconds between individual-deck fetches
+_DECK_DELAY = 1.0
+# Write checkpoint to disk after every N completed decks
+_CHECKPOINT_EVERY = 200
 
 
-async def fetch_all_decks(client: httpx.AsyncClient, start_page: int = 0) -> list[set[str]]:
+def _flush(decks: list[dict], path: Path) -> None:
+    """Atomically write decks to path as JSON."""
+    path.write_text(json.dumps(decks))
+
+
+async def fetch_all_decks(
+    client: httpx.AsyncClient,
+    output_path: Path,
+    ids_path: Path,
+    start_page: int = 1,
+) -> list[dict]:
     """
-    Paginate Archidekt Commander deck list, then fetch each deck individually
-    to retrieve card data. Returns each deck as a set of lowercased card names.
+    Paginate Archidekt Commander deck list, then fetch each deck individually.
+    Returns each deck as a dict with metadata + sorted card list.
+
+    Intermediate state is written to output_path every _CHECKPOINT_EVERY decks
+    and on keyboard interrupt, so re-running resumes where it left off.
+    The deck-ID listing is cached in ids_path to skip the listing phase on resume.
     """
-    deck_ids = await _collect_deck_ids(client)
-    print(f"[archidekt] fetching {len(deck_ids)} individual decks…")
-    decks = await _fetch_decks_concurrent(client, deck_ids)
-    print(f"[archidekt] done — {len(decks)} non-empty decks")
-    return decks
+    # ── Listing phase ─────────────────────────────────────────────────────────
+    if ids_path.exists():
+        listing: list[dict] = json.loads(ids_path.read_text())
+        print(f"[archidekt] resuming — loaded {len(listing)} deck IDs from {ids_path.name}")
+    else:
+        listing = await _collect_deck_listing(client, start_page, ids_path)
+        print(f"[archidekt] saved {len(listing)} deck IDs to {ids_path.name}")
+
+    # ── Resume: skip already-fetched deck IDs ─────────────────────────────────
+    existing_decks: list[dict] = []
+    already_fetched: set[int] = set()
+    if output_path.exists():
+        try:
+            raw: list = json.loads(output_path.read_text())
+            existing_decks = [d for d in raw if isinstance(d, dict) and "id" in d]
+            already_fetched = {d["id"] for d in existing_decks}
+            if already_fetched:
+                print(f"[archidekt] skipping {len(already_fetched)} already-fetched decks")
+        except Exception:
+            pass
+
+    pending = [item for item in listing if item["id"] not in already_fetched]
+    print(f"[archidekt] fetching {len(pending)} individual decks…")
+
+    # ── Fetch phase ───────────────────────────────────────────────────────────
+    new_decks = await _fetch_decks_concurrent(client, pending, existing_decks, output_path)
+    all_decks = existing_decks + new_decks
+    print(f"[archidekt] done — {len(all_decks)} non-empty decks total")
+    return all_decks
 
 
-async def _collect_deck_ids(client: httpx.AsyncClient) -> list[int]:
-    """Page through the deck list endpoint and collect all deck IDs."""
-    ids: list[int] = []
-    page = 1
+async def _collect_deck_listing(
+    client: httpx.AsyncClient, start_page: int = 1, ids_path: Path | None = None
+) -> list[dict]:
+    """
+    Page through the deck-list endpoint and collect deck IDs + basic metadata.
+    Checkpoints to ids_path after every page. Handles keyboard interrupt
+    gracefully, saving progress and returning whatever was collected.
+    """
+    listing: list[dict] = []
+    page = start_page
 
     try:
-        with tqdm(total=1000, desc="fetching pages") as bar:
-            while True:
+        with tqdm(desc="listing pages") as bar:
+            while True:# and page < 100:
                 try:
                     resp = await client.get(
                         LIST_URL,
@@ -41,7 +90,7 @@ async def _collect_deck_ids(client: httpx.AsyncClient) -> list[int]:
                     )
                     resp.raise_for_status()
                 except (httpx.HTTPError, httpx.TimeoutException) as e:
-                    bar.write(f"[archidekt] list stopped at page {page}: {e}")
+                    bar.write(f"[archidekt] listing stopped at page {page}: {e}")
                     break
 
                 data = resp.json()
@@ -49,54 +98,105 @@ async def _collect_deck_ids(client: httpx.AsyncClient) -> list[int]:
                 if not results:
                     break
 
-                ids.extend(deck["id"] for deck in results)
+                for deck in results:
+                    owner = deck.get("owner", "")
+                    listing.append({
+                        "id": deck["id"],
+                        "name": deck.get("name", ""),
+                        "owner": owner.get("username", "") if isinstance(owner, dict) else str(owner),
+                        "created_at": deck.get("createdAt", ""),
+                        "updated_at": deck.get("updatedAt", ""),
+                    })
 
-                # If the API tells us the total count, derive exact page total
-                total_count = data.get("count")
-                if total_count is not None:
-                    page_size = LIST_PARAMS["pageSize"]
-                   # bar.total = -(-total_count // page_size)  # ceil division
+                if ids_path is not None:
+                    _flush(listing, ids_path)
 
-                bar.set_postfix(decks=len(ids))
+                bar.set_postfix(decks=len(listing))
                 bar.update(1)
                 page += 1
-
                 await asyncio.sleep(_LIST_DELAY)
-    except KeyboardInterrupt:
-        print(ids)
 
-    return ids
+    except KeyboardInterrupt:
+        if ids_path is not None:
+            _flush(listing, ids_path)
+        print(f"\n[archidekt] listing interrupted — collected {len(listing)} IDs so far")
+
+    return listing
 
 
 async def _fetch_decks_concurrent(
-    client: httpx.AsyncClient, deck_ids: list[int]
-) -> list[set[str]]:
-    """Fetch individual deck details concurrently with a progress bar."""
-    sem = asyncio.Semaphore(_CONCURRENCY)
+    client: httpx.AsyncClient,
+    pending: list[dict],
+    existing: list[dict],
+    output_path: Path,
+) -> list[dict]:
+    """
+    Fetch individual deck details sequentially with a delay between requests.
+    Writes a checkpoint to output_path every _CHECKPOINT_EVERY completions
+    and always flushes on exit (including keyboard interrupt).
+    """
+    completed: list[dict] = []
 
-    async def fetch_one(deck_id: int) -> set[str]:
-        async with sem:
-            try:
-                resp = await client.get(DECK_URL.format(id=deck_id), timeout=30)
-                resp.raise_for_status()
-                return _extract_cards(resp.json())
-            except (httpx.HTTPError, httpx.TimeoutException) as e:
-                print(f"[archidekt] failed deck {deck_id}: {e}")
-                return set()
+    try:
+        with tqdm(total=len(pending), desc="fetching decks") as bar:
+            for i, item in enumerate(pending):
+                try:
+                    resp = await client.get(DECK_URL.format(id=item["id"]), timeout=30)
+                    resp.raise_for_status()
+                    cards, commanders = _extract_cards(resp.json())
+                    if cards:
+                        completed.append({
+                            "id": item["id"],
+                            "name": item.get("name", ""),
+                            "owner": item.get("owner", ""),
+                            "created_at": item.get("created_at", ""),
+                            "url": f"https://archidekt.com/decks/{item['id']}",
+                            "commanders": commanders,
+                            "cards": sorted(cards),
+                        })
+                except (httpx.HTTPError, httpx.TimeoutException) as e:
+                    tqdm.write(f"[archidekt] failed deck {item['id']}: {e}")
 
-    tasks = [fetch_one(did) for did in deck_ids]
-    results = await asyncio.gather(*tasks)
-    return [r for r in results if r]
+                bar.update(1)
+                n_done = bar.n
+                if n_done % _CHECKPOINT_EVERY == 0:
+                    _flush(existing + completed, output_path)
+                    bar.write(
+                        f"[archidekt] checkpoint — {len(existing) + len(completed)} decks saved"
+                    )
+
+                if i < len(pending) - 1:
+                    await asyncio.sleep(_DECK_DELAY)
+
+    except KeyboardInterrupt:
+        print(f"\n[archidekt] interrupted — saving {len(existing) + len(completed)} decks…")
+    finally:
+        _flush(existing + completed, output_path)
+
+    return completed
 
 
-def _extract_cards(deck: dict) -> set[str]:
-    """Extract card names from an Archidekt deck detail object."""
+def _extract_cards(deck: dict) -> tuple[set[str], list[str]]:
+    """
+    Extract card names and commander names from an Archidekt deck detail object.
+    Returns (cards, commanders) — both use the original-casing name;
+    cards are lowercased when stored.
+    """
     cards: set[str] = set()
+    commanders: list[str] = []
     for card_entry in deck.get("cards", []):
         name = _card_name(card_entry)
-        if name:
-            cards.add(name.lower())
-    return cards
+        if not name:
+            continue
+        cards.add(name.lower())
+        # Detect the "Commander" category (list of strings or dicts)
+        categories = card_entry.get("categories", [])
+        if isinstance(categories, list) and any(
+            (c if isinstance(c, str) else c.get("name", "")).lower() == "commander"
+            for c in categories
+        ):
+            commanders.append(name)
+    return cards, commanders
 
 
 def _card_name(entry: dict) -> str | None:

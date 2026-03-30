@@ -25,7 +25,12 @@ _search_cache: dict[str, frozenset[str]] = {}
 async def lifespan(app: FastAPI):
     if _DECKS_FILE.exists():
         raw = json.loads(_DECKS_FILE.read_text())
-        decks = [set(deck) for deck in raw]
+        # Support both old format (list of card-name lists) and new format
+        # (list of dicts with a "cards" key produced by the updated downloader).
+        decks = [
+            set(entry["cards"]) if isinstance(entry, dict) else set(entry)
+            for entry in raw
+        ]
         deck_index.build(decks)
         print(f"[startup] loaded {len(decks)} decks from {_DECKS_FILE.name}")
     else:
