@@ -62,6 +62,11 @@ export default function ResultCard({ entry, rank, animationDelay = 0 }: Props) {
       </div>
 
       <span className="text-indigo-300 text-sm font-medium tabular-nums shrink-0">{pct}%</span>
+      {entry.price != null && (
+        <span className="text-green-400 text-xs font-medium tabular-nums shrink-0">
+          ${entry.price.toFixed(2)}
+        </span>
+      )}
       {entry.num_decks > 0 && (
         <span className="text-gray-600 text-xs shrink-0">
           {entry.num_decks.toLocaleString()} decks

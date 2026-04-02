@@ -27,6 +27,7 @@ async def fetch_all_decks(
     client: httpx.AsyncClient,
     output_path: Path,
     ids_path: Path,
+    errors_path: Path,
     start_page: int = 1,
 ) -> list[dict]:
     """
@@ -36,6 +37,7 @@ async def fetch_all_decks(
     Intermediate state is written to output_path every _CHECKPOINT_EVERY decks
     and on keyboard interrupt, so re-running resumes where it left off.
     The deck-ID listing is cached in ids_path to skip the listing phase on resume.
+    IDs that error are saved to errors_path and skipped on resume.
     """
     # ── Listing phase ─────────────────────────────────────────────────────────
     if ids_path.exists():
@@ -58,11 +60,22 @@ async def fetch_all_decks(
         except Exception:
             pass
 
-    pending = [item for item in listing if item["id"] not in already_fetched]
+    # ── Resume: skip previously errored deck IDs ──────────────────────────────
+    existing_errors: set[int] = set()
+    if errors_path.exists():
+        try:
+            existing_errors = set(json.loads(errors_path.read_text()))
+            if existing_errors:
+                print(f"[archidekt] skipping {len(existing_errors)} previously errored decks")
+        except Exception:
+            pass
+
+    skip = already_fetched | existing_errors
+    pending = [item for item in listing if item["id"] not in skip]
     print(f"[archidekt] fetching {len(pending)} individual decks…")
 
     # ── Fetch phase ───────────────────────────────────────────────────────────
-    new_decks = await _fetch_decks_concurrent(client, pending, existing_decks, output_path)
+    new_decks = await _fetch_decks_concurrent(client, pending, existing_decks, output_path, existing_errors, errors_path)
     all_decks = existing_decks + new_decks
     print(f"[archidekt] done — {len(all_decks)} non-empty decks total")
     return all_decks
@@ -81,7 +94,7 @@ async def _collect_deck_listing(
 
     try:
         with tqdm(desc="listing pages") as bar:
-            while True:# and page < 100:
+            while True and page < 10000:
                 try:
                     resp = await client.get(
                         LIST_URL,
@@ -129,13 +142,21 @@ async def _fetch_decks_concurrent(
     pending: list[dict],
     existing: list[dict],
     output_path: Path,
+    existing_errors: set[int],
+    errors_path: Path,
 ) -> list[dict]:
     """
     Fetch individual deck details sequentially with a delay between requests.
     Writes a checkpoint to output_path every _CHECKPOINT_EVERY completions
     and always flushes on exit (including keyboard interrupt).
+    Failed deck IDs are accumulated and saved to errors_path.
     """
     completed: list[dict] = []
+    new_errors: set[int] = set()
+    all_errors = existing_errors | new_errors
+
+    def _flush_errors() -> None:
+        errors_path.write_text(json.dumps(sorted(all_errors)))
 
     try:
         with tqdm(total=len(pending), desc="fetching decks") as bar:
@@ -156,13 +177,16 @@ async def _fetch_decks_concurrent(
                         })
                 except (httpx.HTTPError, httpx.TimeoutException) as e:
                     tqdm.write(f"[archidekt] failed deck {item['id']}: {e}")
+                    new_errors.add(item["id"])
+                    all_errors.add(item["id"])
 
                 bar.update(1)
                 n_done = bar.n
                 if n_done % _CHECKPOINT_EVERY == 0:
                     _flush(existing + completed, output_path)
+                    _flush_errors()
                     bar.write(
-                        f"[archidekt] checkpoint — {len(existing) + len(completed)} decks saved"
+                        f"[archidekt] checkpoint — {len(existing) + len(completed)} decks saved, {len(all_errors)} errors"
                     )
 
                 if i < len(pending) - 1:
@@ -172,6 +196,10 @@ async def _fetch_decks_concurrent(
         print(f"\n[archidekt] interrupted — saving {len(existing) + len(completed)} decks…")
     finally:
         _flush(existing + completed, output_path)
+        _flush_errors()
+
+    if new_errors:
+        print(f"[archidekt] {len(new_errors)} decks failed — IDs saved to {errors_path.name}")
 
     return completed
 

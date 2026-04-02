@@ -5,6 +5,7 @@ export interface ResultEntry {
   inclusion: number;
   num_decks: number;
   source: string;
+  price?: number | null;
 }
 
 export interface UniqueEntry {
@@ -12,6 +13,7 @@ export interface UniqueEntry {
   inclusion: number;
   overall_inclusion: number;
   lift: number;
+  price?: number | null;
 }
 
 export interface PackageEntry {
@@ -25,6 +27,7 @@ export interface AntiCorrelationEntry {
   inclusion: number;
   overall_inclusion: number;
   anti_lift: number;
+  price?: number | null;
 }
 
 export interface ExclusiveEntry {
@@ -32,12 +35,14 @@ export interface ExclusiveEntry {
   inclusion: number;
   max_single_inclusion: number;
   exclusivity: number;
+  price?: number | null;
 }
 
 export interface RecommendResponse {
   source_used: string;
   deck_count: number;
   matching_decks: number;
+  matching_deck_ids: number[];
   consensus: number;
   results: ResultEntry[];
   unique_includes: UniqueEntry[];
@@ -46,11 +51,11 @@ export interface RecommendResponse {
   exclusive: ExclusiveEntry[];
 }
 
-export async function recommend(cards: string[]): Promise<RecommendResponse> {
+export async function recommend(cards: string[], filter?: string | null): Promise<RecommendResponse> {
   const res = await fetch(`${BASE}/api/recommend`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cards }),
+    body: JSON.stringify({ cards, filter: filter || null }),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();

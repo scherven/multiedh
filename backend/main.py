@@ -1,6 +1,4 @@
 from __future__ import annotations
-import json
-from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -9,36 +7,21 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from index import deck_index
+from index import DeckIndex
+from live_query import RateLimitError, fetch_matching_decks
 
-_DECKS_FILE = Path(__file__).parent / "decks.json"
+_DIR = Path(__file__).parent
+_CACHE_DIR = _DIR / "cache"
 SCRYFALL_SEARCH = "https://api.scryfall.com/cards/search"
 SCRYFALL_AUTOCOMPLETE = "https://api.scryfall.com/cards/autocomplete"
+SCRYFALL_COLLECTION = "https://api.scryfall.com/cards/collection"
 SCRYFALL_MAX_PAGES = 5  # cap at 875 cards per filter query
 
 _search_cache: dict[str, frozenset[str]] = {}
+_price_cache: dict[str, float | None] = {}
 
 
-# ── Startup ───────────────────────────────────────────────────────────────────
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    if _DECKS_FILE.exists():
-        raw = json.loads(_DECKS_FILE.read_text())
-        # Support both old format (list of card-name lists) and new format
-        # (list of dicts with a "cards" key produced by the updated downloader).
-        decks = [
-            set(entry["cards"]) if isinstance(entry, dict) else set(entry)
-            for entry in raw
-        ]
-        deck_index.build(decks)
-        print(f"[startup] loaded {len(decks)} decks from {_DECKS_FILE.name}")
-    else:
-        print(f"[startup] {_DECKS_FILE} not found — run download.py first")
-    yield
-
-
-app = FastAPI(title="Multi-Card Recommender", lifespan=lifespan)
+app = FastAPI(title="Multi-Card Recommender")
 
 app.add_middleware(
     CORSMiddleware,
@@ -91,36 +74,79 @@ def _apply_filter(items: list[dict], filter_set: frozenset[str]) -> list[dict]:
     return [item for item in items if item["name"].lower() in filter_set]
 
 
+async def _fetch_prices(client: httpx.AsyncClient, names: list[str]) -> dict[str, float | None]:
+    """Batch-fetch USD prices from Scryfall for a list of (lowercase) card names."""
+    to_fetch = [n for n in names if n not in _price_cache]
+    for i in range(0, len(to_fetch), 75):
+        chunk = to_fetch[i : i + 75]
+        try:
+            resp = await client.post(
+                SCRYFALL_COLLECTION,
+                json={"identifiers": [{"name": n} for n in chunk]},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                for n in chunk:
+                    _price_cache[n] = None
+                continue
+            data = resp.json()
+            found: dict[str, float | None] = {}
+            for card in data.get("data", []):
+                key = card.get("name", "").lower()
+                price_str = card.get("prices", {}).get("usd")
+                found[key] = float(price_str) if price_str else None
+            for n in chunk:
+                _price_cache[n] = found.get(n)
+        except Exception:
+            for n in chunk:
+                _price_cache[n] = None
+    return {n: _price_cache.get(n) for n in names}
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.post("/api/recommend")
 async def recommend(req: RecommendRequest) -> dict[str, Any]:
     if not req.cards:
         raise HTTPException(400, "Provide at least one card")
-    if not deck_index.loaded:
-        raise HTTPException(503, "Deck data not loaded — run download.py first")
 
     input_cards = [c.lower().strip() for c in req.cards]
-    results, unique, packages, anti, exclusive, consensus = deck_index.query(input_cards, limit=req.limit)
 
-    sets = [deck_index.inverted.get(c, set()) for c in input_cards]
-    matching = sets[0].copy()
-    for s in sets[1:]:
-        matching &= s
+    async with httpx.AsyncClient() as client:
+        try:
+            decks, _ = await fetch_matching_decks(client, input_cards, _CACHE_DIR)
+        except RateLimitError as e:
+            raise HTTPException(429, str(e))
 
-    filter_info = None
-    if req.filter:
-        async with httpx.AsyncClient() as client:
+        if not decks:
+            raise HTTPException(404, "No decks found containing all specified cards")
+
+        index = DeckIndex()
+        index.build([set(d["cards"]) for d in decks])
+        results, unique, packages, anti, exclusive, consensus = index.query(input_cards, limit=req.limit)
+
+        filter_info = None
+        if req.filter:
             filter_set = await _resolve_filter(client, req.filter)
-        filter_info = {"query": req.filter, "card_count": len(filter_set)}
-        results = _apply_filter(results, filter_set)
-        unique = _apply_filter(unique, filter_set)
-        anti = _apply_filter(anti, filter_set)
-        exclusive = _apply_filter(exclusive, filter_set)
+            filter_info = {"query": req.filter, "card_count": len(filter_set)}
+            results = _apply_filter(results, filter_set)
+            unique = _apply_filter(unique, filter_set)
+            anti = _apply_filter(anti, filter_set)
+            exclusive = _apply_filter(exclusive, filter_set)
+
+        all_names = list(dict.fromkeys(
+            e["name"] for lst in (results, unique, anti, exclusive) for e in lst
+        ))
+        prices = await _fetch_prices(client, all_names)
+
+    for lst in (results, unique, anti, exclusive):
+        for entry in lst:
+            entry["price"] = prices.get(entry["name"])
 
     return {
-        "deck_count": len(deck_index.decks),
-        "matching_decks": len(matching),
+        "deck_count": len(decks),
+        "matching_decks": len(decks),
+        "matching_deck_ids": [d["id"] for d in decks],
         "consensus": round(consensus, 4),
         "filter": filter_info,
         "results": results,
@@ -129,16 +155,6 @@ async def recommend(req: RecommendRequest) -> dict[str, Any]:
         "anti_correlations": anti,
         "exclusive": exclusive,
     }
-
-
-@app.post("/api/reload")
-async def reload() -> dict[str, Any]:
-    if _DECKS_FILE.exists():
-        raw = json.loads(_DECKS_FILE.read_text())
-        decks = [set(deck) for deck in raw]
-        deck_index.build(decks)
-        return {"deck_count": len(decks)}
-    return {"deck_count": 0}
 
 
 @app.get("/api/autocomplete")
@@ -154,8 +170,9 @@ async def autocomplete(q: str = Query(..., min_length=2)) -> list[str]:
 
 @app.get("/api/status")
 async def status() -> dict[str, Any]:
+    cache_cards = len(list((_CACHE_DIR / "cards").glob("*.json"))) if (_CACHE_DIR / "cards").exists() else 0
+    cache_decks = len(list((_CACHE_DIR / "decks").glob("*.json"))) if (_CACHE_DIR / "decks").exists() else 0
     return {
-        "deck_count": len(deck_index.decks),
-        "data_file": str(_DECKS_FILE),
-        "data_file_exists": _DECKS_FILE.exists(),
+        "cached_cards": cache_cards,
+        "cached_decks": cache_decks,
     }

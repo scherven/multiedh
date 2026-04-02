@@ -5,7 +5,7 @@ import CardTag from "./components/CardTag";
 import ResultCard from "./components/ResultCard";
 import { useCardImage, toSize } from "./scryfall";
 
-type Tab = "results" | "unique" | "packages" | "anti" | "exclusive";
+type Tab = "results" | "unique" | "packages" | "anti" | "exclusive" | "decks";
 
 function SkeletonRow({ opacity }: { opacity: number }) {
   return (
@@ -23,7 +23,7 @@ function SkeletonRow({ opacity }: { opacity: number }) {
   );
 }
 
-function CardRow({ name, metric, metricLabel, sub }: { name: string; metric: string; metricLabel?: string; sub?: string }) {
+function CardRow({ name, metric, metricLabel, sub, price }: { name: string; metric: string; metricLabel?: string; sub?: string; price?: number | null }) {
   const img = useCardImage(name);
   const slug = name.toLowerCase().replace(/[^a-z0-9\s-]/g, "").replace(/\s+/g, "-");
   return (
@@ -51,6 +51,11 @@ function CardRow({ name, metric, metricLabel, sub }: { name: string; metric: str
         </a>
         {sub && <p className="text-gray-500 text-xs mt-0.5">{sub}</p>}
       </div>
+      {price != null && (
+        <span className="text-green-400 text-xs font-medium tabular-nums shrink-0">
+          ${price.toFixed(2)}
+        </span>
+      )}
       <span className="text-indigo-300 text-sm font-medium tabular-nums shrink-0">
         {metric}
         {metricLabel && <span className="text-gray-500 text-xs ml-1">{metricLabel}</span>}
@@ -69,6 +74,7 @@ function UniqueSection({ items }: { items: UniqueEntry[] }) {
           metric={`${e.lift.toFixed(1)}×`}
           metricLabel="lift"
           sub={`${Math.round(e.inclusion * 100)}% in matching · ${Math.round(e.overall_inclusion * 100)}% overall`}
+          price={e.price}
         />
       ))}
     </div>
@@ -113,6 +119,7 @@ function AntiSection({ items }: { items: AntiCorrelationEntry[] }) {
           metric={`${e.anti_lift.toFixed(2)}×`}
           metricLabel="anti-lift"
           sub={`${Math.round(e.inclusion * 100)}% in matching · ${Math.round(e.overall_inclusion * 100)}% overall`}
+          price={e.price}
         />
       ))}
     </div>
@@ -129,7 +136,26 @@ function ExclusiveSection({ items }: { items: ExclusiveEntry[] }) {
           metric={`${e.exclusivity.toFixed(1)}×`}
           metricLabel="exclusivity"
           sub={`${Math.round(e.inclusion * 100)}% combo · ${Math.round(e.max_single_inclusion * 100)}% single-card max`}
+          price={e.price}
         />
+      ))}
+    </div>
+  );
+}
+
+function DecksSection({ ids }: { ids: number[] }) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      {ids.map(id => (
+        <a
+          key={id}
+          href={`https://archidekt.com/decks/${id}`}
+          target="_blank"
+          rel="noreferrer"
+          className="px-3 py-2 bg-gray-800/60 border border-white/5 rounded-xl text-indigo-300 text-sm hover:bg-gray-700/50 hover:text-indigo-200 transition-colors animate-fade-in-up"
+        >
+          archidekt.com/decks/{id}
+        </a>
       ))}
     </div>
   );
@@ -137,6 +163,7 @@ function ExclusiveSection({ items }: { items: ExclusiveEntry[] }) {
 
 export default function App() {
   const [cards, setCards] = useState<string[]>([]);
+  const [filterQuery, setFilterQuery] = useState("");
   const [response, setResponse] = useState<RecommendResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -150,7 +177,7 @@ export default function App() {
       setLoading(true);
       setError(null);
       try {
-        const res = await recommend(cards);
+        const res = await recommend(cards, filterQuery || null);
         setResponse(res);
         setActiveTab("results");
       } catch (e) {
@@ -159,7 +186,7 @@ export default function App() {
         setLoading(false);
       }
     }, 400);
-  }, [cards]);
+  }, [cards, filterQuery]);
 
   function addCard(name: string) {
     if (!cards.includes(name)) setCards(c => [...c, name]);
@@ -175,6 +202,7 @@ export default function App() {
     { id: "packages", label: "Packages", count: response.packages.length },
     { id: "anti", label: "Anti", count: response.anti_correlations.length },
     ...(response.exclusive.length > 0 ? [{ id: "exclusive" as Tab, label: "Exclusive", count: response.exclusive.length }] : []),
+    ...(response.matching_deck_ids?.length > 0 ? [{ id: "decks" as Tab, label: "Decks", count: response.matching_deck_ids.length }] : []),
   ] : [];
 
   const hasResults = response && (
@@ -207,6 +235,25 @@ export default function App() {
         )}
 
         <CardInput onAdd={addCard} existing={cards} />
+
+        {/* Scryfall filter */}
+        <div className="mt-3 flex items-center gap-2">
+          <input
+            type="text"
+            value={filterQuery}
+            onChange={e => setFilterQuery(e.target.value)}
+            placeholder="Scryfall filter (e.g. type:creature cmc<=3)"
+            className="flex-1 px-3 py-1.5 bg-gray-800 border border-white/10 rounded-lg text-sm text-white placeholder-gray-600 focus:outline-none focus:border-indigo-500/50 transition-colors"
+          />
+          {filterQuery && (
+            <button
+              onClick={() => setFilterQuery("")}
+              className="text-gray-500 hover:text-gray-300 text-xs transition-colors shrink-0"
+            >
+              clear
+            </button>
+          )}
+        </div>
 
         {/* Error */}
         {error && (
@@ -259,6 +306,7 @@ export default function App() {
               {activeTab === "packages" && <PackagesSection items={response.packages} />}
               {activeTab === "anti" && <AntiSection items={response.anti_correlations} />}
               {activeTab === "exclusive" && <ExclusiveSection items={response.exclusive} />}
+              {activeTab === "decks" && <DecksSection ids={response.matching_deck_ids ?? []} />}
             </div>
           </>
         )}
