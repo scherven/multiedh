@@ -164,11 +164,18 @@ function DecksSection({ ids }: { ids: number[] }) {
 export default function App() {
   const [cards, setCards] = useState<string[]>([]);
   const [filterQuery, setFilterQuery] = useState("");
+  const [debouncedFilter, setDebouncedFilter] = useState("");
   const [response, setResponse] = useState<RecommendResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>("results");
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const filterDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    if (filterDebounceRef.current) clearTimeout(filterDebounceRef.current);
+    filterDebounceRef.current = setTimeout(() => setDebouncedFilter(filterQuery), 900);
+  }, [filterQuery]);
 
   useEffect(() => {
     if (cards.length === 0) { setResponse(null); return; }
@@ -177,7 +184,7 @@ export default function App() {
       setLoading(true);
       setError(null);
       try {
-        const res = await recommend(cards, filterQuery || null);
+        const res = await recommend(cards, debouncedFilter || null);
         setResponse(res);
         setActiveTab("results");
       } catch (e) {
@@ -186,7 +193,7 @@ export default function App() {
         setLoading(false);
       }
     }, 400);
-  }, [cards, filterQuery]);
+  }, [cards, debouncedFilter]);
 
   function addCard(name: string) {
     if (!cards.includes(name)) setCards(c => [...c, name]);

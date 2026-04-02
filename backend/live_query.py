@@ -31,6 +31,10 @@ PAGE_SIZE = 100
 _ID_DELAY = 2.0    # seconds between pagination requests for a single card
 _DECK_DELAY = 2.0  # seconds between individual deck fetches (uncached only)
 
+# Serializes all get_deck_ids_for_card network fetches across concurrent requests.
+# New requests queue here rather than interrupting an in-progress paginating fetch.
+_id_lock = asyncio.Lock()
+
 
 class RateLimitError(Exception):
     pass
@@ -45,22 +49,12 @@ def _ensure_cache(cache_dir: Path) -> None:
     (cache_dir / "decks").mkdir(parents=True, exist_ok=True)
 
 
-async def get_deck_ids_for_card(
+async def _fetch_ids_inner(
     client: httpx.AsyncClient,
     card_name: str,
-    cache_dir: Path,
+    cache_file: Path,
 ) -> list[int]:
-    """
-    Return all Archidekt Commander deck IDs that contain card_name.
-    Results are cached to cache_dir/cards/{slug}.json.
-    """
-    slug = _slug(card_name)
-    cache_file = cache_dir / "cards" / f"{slug}.json"
-
-    if cache_file.exists():
-        print(f"[live_query] card cache hit: {card_name}", flush=True)
-        return json.loads(cache_file.read_text())
-
+    """Paginate Archidekt and write results to cache_file. Called under _id_lock."""
     ids: list[int] = []
     page = 1
 
@@ -101,6 +95,42 @@ async def get_deck_ids_for_card(
     cache_file.write_text(json.dumps(ids))
     print(f"[live_query] cached {len(ids)} deck IDs for '{card_name}'", flush=True)
     return ids
+
+
+async def get_deck_ids_for_card(
+    client: httpx.AsyncClient,
+    card_name: str,
+    cache_dir: Path,
+) -> list[int]:
+    """
+    Return all Archidekt Commander deck IDs that contain card_name.
+    Results are cached to cache_dir/cards/{slug}.json.
+
+    Concurrent calls are serialized via _id_lock so only one paginating fetch
+    runs at a time. The actual network work is wrapped in asyncio.shield() so
+    that if the outer task is cancelled (by a newer request), the fetch runs to
+    completion and writes the cache before the lock is released.
+    """
+    slug = _slug(card_name)
+    cache_file = cache_dir / "cards" / f"{slug}.json"
+
+    # Fast path: already cached — no need to acquire the lock.
+    if cache_file.exists():
+        print(f"[live_query] card cache hit: {card_name}", flush=True)
+        return json.loads(cache_file.read_text())
+
+    async with _id_lock:
+        # Double-check: another request may have populated the cache while
+        # we were waiting to acquire the lock.
+        if cache_file.exists():
+            print(f"[live_query] card cache hit (post-lock): {card_name}", flush=True)
+            return json.loads(cache_file.read_text())
+
+        # Shield the network work so that a cancellation of the outer task
+        # does not interrupt an in-progress paginating fetch.  The inner task
+        # will finish and write the cache; the lock is released only after it
+        # does, so the next queued caller will see the cache hit.
+        return await asyncio.shield(_fetch_ids_inner(client, card_name, cache_file))
 
 
 async def get_deck_details(

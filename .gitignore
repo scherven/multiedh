@@ -1,2 +1,3 @@
 backend/cache/cards
 *.json
+*.pyc

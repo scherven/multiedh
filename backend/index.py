@@ -61,7 +61,6 @@ class DeckIndex:
     def query(
         self,
         input_cards: list[str],
-        limit: int = 100,
     ) -> tuple[
         list[ResultEntry],
         list[UniqueEntry],
@@ -100,17 +99,17 @@ class DeckIndex:
             if inc >= MIN_INCLUSION:
                 entries.append(ResultEntry(name=card, inclusion=inc, num_decks=cnt))
         entries.sort(key=lambda e: e["inclusion"], reverse=True)
-        results = entries[:limit]
+        results = entries
 
-        unique = self._compute_unique(entries, limit)
+        unique = self._compute_unique(entries)
         packages = _find_packages(entries[:PACKAGE_TOP_N], matching, self.decks, n_matching)
-        anti = self._compute_anti(entries, limit)
+        anti = self._compute_anti(entries)
         exclusive = self._compute_exclusive(entries[:EXCLUSIVITY_TOP_N], normalized, n_matching) if len(normalized) >= 2 else []
         consensus = _compute_consensus(matching, self.decks)
 
         return results, unique, packages, anti, exclusive, consensus
 
-    def _compute_unique(self, entries: list[ResultEntry], limit: int) -> list[UniqueEntry]:
+    def _compute_unique(self, entries: list[ResultEntry]) -> list[UniqueEntry]:
         unique: list[UniqueEntry] = []
         for e in entries:
             overall = self._overall.get(e["name"], 0)
@@ -120,9 +119,9 @@ class DeckIndex:
             if lift >= MIN_UNIQUE_LIFT and e["inclusion"] >= MIN_UNIQUE_INCLUSION:
                 unique.append(UniqueEntry(name=e["name"], inclusion=e["inclusion"], overall_inclusion=overall, lift=lift))
         unique.sort(key=lambda u: u["lift"], reverse=True)
-        return unique[:limit]
+        return unique
 
-    def _compute_anti(self, entries: list[ResultEntry], limit: int) -> list[AntiCorrelationEntry]:
+    def _compute_anti(self, entries: list[ResultEntry]) -> list[AntiCorrelationEntry]:
         anti: list[AntiCorrelationEntry] = []
         for e in entries:
             overall = self._overall.get(e["name"], 0)
@@ -132,7 +131,7 @@ class DeckIndex:
             if anti_lift <= MAX_ANTI_LIFT:
                 anti.append(AntiCorrelationEntry(name=e["name"], inclusion=e["inclusion"], overall_inclusion=overall, anti_lift=anti_lift))
         anti.sort(key=lambda a: a["anti_lift"])
-        return anti[:limit]
+        return anti
 
     def _compute_exclusive(
         self,
